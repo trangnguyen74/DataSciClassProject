@@ -1,0 +1,1035 @@
+---
+title: "Data Science: Quick, Draw! Classification of Edibles"
+author: "Trang Quynh Nguyen"
+output: 
+  html_document:
+    theme: cosmo 
+    toc: true
+    # toc_float: true
+    highlight: tango
+    number_sections: false
+fig_width: 4
+fig_height: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+options(width = 100)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(rjson)
+```
+
+
+
+
+# Data wrangling
+
+Data download requires signing into the Kaggle competition, so we cannot download data automaticall. Here we check if the data file has been downloaded and placed in a subdirectory <tt>data</tt> in the project directory.
+
+```{r}
+if(!dir.exists(here::here("data"))) { dir.create(here::here("data")) }
+if(!file.exists(here::here("data", "train_simplified.zip"))) {
+    paste0(c("You need to download the data file train_simplified.zip from\n",
+             "https://www.kaggle.com/c/quickdraw-doodle-recognition/data",
+             "first!"))
+}
+```
+
+For this project, we will consider only a subset of the categories, including fruits, vegetables, cakes, candies and dishes, which we refer to as "some edibles".
+
+```{r}
+all.categories <- 
+    unzip(here::here("data", "train_simplified.zip"), list = TRUE)$Name %>%
+    as.character() %>%
+    sort() %>%
+    {sub(".csv", "", .)}
+```
+
+```{r}
+some.edibles <- c("apple", "asparagus",
+                  "banana", "birthday cake", "blueberry",
+                  "blackberry", "bread", "broccoli",
+                  "cake", "carrot", "cookie",
+                  "donut",
+                  "grapes",
+                  "hamburger", "hot dog",
+                  "ice cream", 
+                  "lollipop",
+                  "mushroom",
+                  "onion",
+                  "peanut", "pear", "peas", "pineapple", "pizza", "popsicle",
+                  "potato", 
+                  "sandwich", "steak", "strawberry", "string bean",
+                  "watermelon")
+setdiff(some.edibles, all.categories)
+```
+
+
+The function <tt>get.500</tt> below borrows heavily from Lacey's function <tt>format.one.food</tt>. It extracts, for each category of drawing and each country of origin, two files, one including up to 500 first drawings that the AI of the game was able to recognize as belonging to the category and up to 500 first drawings that were not recognized. These are stored in two separate files. In each file, points (data rows) that define strokes are nested in strokes (variable <tt>stroke</tt>), which are nested in picture (variable <tt>key_id</tt>).
+
+```{r}
+get.500 <- function(category, n_max = 500) {
+    if(!dir.exists(here::here("data", "train_simplified"))) {
+        dir.create(here::here("data", "train_simplified"))
+    }
+    if(!dir.exists(here::here("data", "train_simplified", category))) {
+        dir.create(here::here("data", "train_simplified", category))
+        
+        dat <- read_csv(unz(here::here("data", "train_simplified.zip"),
+                            paste0(category,".csv")), col_types = cols()) %>%
+            select(-c(timestamp, word))
+        
+        sapply(unique(dat$countrycode), function(country) {
+            
+            country.dat <- dat %>% 
+                filter(countrycode == country) %>%
+                select(-countrycode)
+            
+            sapply(unique(country.dat$recognized), function(recognized.val) {
+                sub <- country.dat %>%
+                    filter(recognized == recognized.val) %>%
+                    select(-recognized) %>%
+                    head(n_max) %>%
+                    mutate(drawing = map(drawing, fromJSON)) %>%
+                    unnest() %>%
+                    mutate(drawing = map(drawing, 
+                                         ~ do.call(., what="rbind") %>%
+                                             t %>%
+                                             as_tibble())) %>%
+                    unnest(.id = "stroke") %>%
+                    rename(x = "V1", y = "V2") %>%
+                    mutate(x = as.integer(x), y = as.integer(y))
+                
+                if(recognized.val == "True") {
+                    file.name <- paste0(country, "_recognized.csv")
+                } else {
+                    file.name <- paste0(country, "_unrecognized.csv")
+                }
+                
+                write_csv(sub, 
+                          path = here::here("data", "train_simplified",
+                                            category, file.name))
+            })
+        })
+    }
+}
+```
+
+
+Let's extract such data for all the edibles we are interested in, if the data are not yet extracted.
+
+```{r, warning=FALSE, message=FALSE, results='hide'}
+for(i in some.edibles) { get.500(i) }
+```
+
+
+# Image pre-processing
+
+The purpose of this part of the work is to hopefully come up with procedures to pre-process the images to enhance the signal of the categories they belong to.
+
+These procedures can be applied to drawings in the train set before using them to train classification models, as well as to drawings in the test set before feeding them to the classifier.
+
+Ideally we want to run one procedure on all the drawings (of any type), as that is the simplest.
+
+I don't yet rule out the option of multiple procedures tailored to different drawing categories. That makes things more complicated for sure, but there must be way to bundle pre-processing and classifcation such that for an unknown image, we could (1) pre-process as if apple and get an apple score, and (2) pre-process as if banana and get a banana score, etc. and (n) compare apple, banana, etc., scores and classify. This would require some scoring system that is pre-processing-invariant. The log-likelihood does not satisfy this criterion, as image distortion changes the data and thus changes the basis of the log-likelihood.
+
+So the goal of this step is dual: find a pre-processing procedure that works best for each category, and find a pre-processing procedure that is category-blind.
+
+We first look at each category separately, and then look at them together.
+
+To simplify things, we will consider data from the US at this point.
+
+## Apple
+
+Below is a function to look at several recognized and unrecognized drawings of a category.
+
+```{r, fig.width=12, fig.height=4}
+several.samples <- function(category, country = "US") {
+    p <- bind_rows(
+        read_csv(here::here("data", "train_simplified", category,
+                            paste0(country, "_recognized.csv")),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 6)) %>%
+            mutate(key_id = 
+                       factor(key_id, labels = paste0("sample ", seq(1, 6))),
+                   status = "recognized"),
+        read_csv(here::here("data", "train_simplified", category,
+                            paste0(country, "_unrecognized.csv")),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 6)) %>%
+            mutate(key_id = 
+                       factor(key_id, labels = paste0("sample ", seq(1, 6))),
+                   status = "unrecognized")
+) %>%
+    ggplot() +
+    geom_path(aes(x = x, y = y, group = stroke)) +
+    theme_bw() +
+    theme(legend.position = "none") +
+    facet_grid(status ~ key_id) +
+    ggtitle(paste0("Several recognized and unrecognized ",
+                   category, " samples"))
+    p
+}
+```
+
+Let's look at some apples
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("apple")
+```
+
+We see that these drawings are scaled and centered so that they touch the top and left sides of the frame, and at least one of the other two sides. We will now overlay many apples (all recognized ones) on one another to see their commonality. We want to compare plots that use the original data and plots that use one or more image processing tricks: dropping the drawings to the bottom of the frame, centering, stretching, etc. To do this, we need the following functions.
+
+```{r}
+to.bottom <- function(data) {
+    data %>%
+        group_by(key_id) %>%
+        mutate(y = y - min(y)) %>%
+        ungroup()
+}
+
+to.top <- function(data) {
+    data %>%
+        group_by(key_id) %>%
+        mutate(y = y + (255 - max(y))) %>%
+        ungroup()
+}
+
+to.right <- function(data) {
+    data %>%
+        group_by(key_id) %>%
+        mutate(x = x + (255 - max(x))) %>%
+        ungroup()
+}
+
+to.left <- function(data) {
+    data %>%
+        group_by(key_id) %>%
+        mutate(x = x - min(x)) %>%
+        ungroup()
+}
+
+center.x <- function(data) {
+    data %>%
+        group_by(key_id) %>%
+        mutate(x = x + (0+255)/2 - ((min(x)+max(x))/2)) %>%
+        ungroup()
+}
+
+center.y <- function(data) {
+    data %>%
+        group_by(key_id) %>%
+        mutate(y = y + (0+255)/2 - ((min(y)+max(y))/2)) %>%
+        ungroup()
+}
+
+stretch.x <- function(data) {
+    data %>%
+        to.left() %>%
+        group_by(key_id) %>%
+        mutate(x = x * 255 / max(x)) %>%
+        ungroup()
+}
+
+stretch.y <- function(data) {
+    data %>%
+        to.bottom() %>%
+        group_by(key_id) %>%
+        mutate(y = y * 255 / max(y)) %>%
+        ungroup()
+}
+
+scale.to.width <- function(data) {
+    data %>%
+        to.bottom() %>%
+        to.left() %>%
+        group_by(key_id) %>%
+        mutate(x2 = x * 255 / max(x),
+               y = y * 255 / max(x),
+               x = x2) %>%
+        select(-x2) %>%
+        ungroup()
+}
+
+scale.to.height <- function(data) {
+    data %>%
+        to.bottom() %>%
+        to.left() %>%
+        group_by(key_id) %>%
+        mutate(y2 = y * 255 / max(y),
+               x = x * 255 / max(y),
+               y = y2) %>%
+        select(-y2) %>%
+        ungroup()
+}
+
+integer.xy <- function(data) {
+    data %>%
+        mutate(x = as.integer(round(x)),
+               y = as.integer(round(y)))
+}
+```
+
+Let's make sure these functions work the way they are supposed to
+
+```{r, fig.width=10, fig.height=5.5}
+dat <- bind_rows(
+    read_csv(here::here("data", "train_simplified", "apple",
+                    "US_recognized.csv"),
+             col_types = cols()) %>% 
+        filter(key_id == min(key_id)),
+    read_csv(here::here("data", "train_simplified", "apple",
+                        "US_recognized.csv"),
+             col_types = cols()) %>% 
+        filter(key_id == max(key_id))
+)
+dat <- bind_rows(
+    dat                       %>% mutate(image = "original"),
+    dat %>% to.bottom()       %>% mutate(image = "to.bottom"),
+    dat %>% to.right()        %>% mutate(image = "to.right"),
+    dat %>% center.x()        %>% mutate(image = "center.x"),
+    dat %>% center.y()        %>% mutate(image = "center.y"),
+    dat %>% stretch.x()       %>% mutate(image = "stretch.x"),
+    dat %>% stretch.y()       %>% mutate(image = "stretch.y"),
+    dat %>% scale.to.width()  %>% mutate(image = "scale.to.width"),
+    dat %>% scale.to.height() %>% mutate(image = "scale.to.height")
+) %>%
+    mutate(image = factor(image, levels = c("original",
+                                            "to.bottom",
+                                            "to.right",
+                                            "center.x",
+                                            "center.y",
+                                            "stretch.x",
+                                            "stretch.y",
+                                            "scale.to.width",
+                                            "scale.to.height")))
+
+p1 <- dat %>% filter(key_id == min(key_id)) %>%
+    ggplot() +
+    geom_path(aes(x = x, y = y, group = stroke)) +
+    theme_bw() +
+    ylim(0, 255) + 
+    xlim(0, 255) +
+    facet_wrap(~ image, ncol = 3)
+
+p2 <- dat %>% filter(key_id == max(key_id)) %>%
+    ggplot() +
+    geom_path(aes(x = x, y = y, group = stroke)) +
+    theme_bw() +
+    ylim(0, 255) + 
+    xlim(0, 255) +
+    facet_wrap(~ image, ncol = 3)
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+They do.
+
+We will also use the function below a lot to overlay the drawings.
+
+```{r}
+overlay.256 <- function(dat) {
+    dat %>% 
+        ggplot(aes(x = x, y = y)) + 
+        geom_path(aes(group = stroke, alpha = .000001), size = .000001) +
+        theme_void() +
+        theme(legend.position = "none") +
+        ylim(255, 0) + 
+        xlim(0, 255)
+}
+
+overlay.32 <- function(dat) {
+    dat %>% 
+        ggplot(aes(x = x, y = y)) + 
+        geom_path(aes(group = stroke, alpha = .000001), size = .000001) +
+        theme_void() +
+        theme(legend.position = "none") +
+        ylim(31, 0) + 
+        xlim(0, 31)
+}
+```
+
+Let's look at a sample of 200 (recognized) apples from the US.
+
+```{r, fig.width=7.5, fig.height=5.5}
+dat <- read_csv(here::here("data", "train_simplified", "apple",
+                           "US_recognized.csv"),
+                col_types = cols()) %>%
+    filter(key_id %in% sample(unique(key_id), 200))
+
+p1 <- overlay.256(dat) + ggtitle("original (top-left)")
+p2 <- overlay.256(dat %>% center.x) + ggtitle("top-center")
+p3 <- overlay.256(dat %>% to.right) + ggtitle("top-right")
+p4 <- overlay.256(dat %>% to.bottom) + ggtitle("bottom-left")
+p5 <- overlay.256(dat %>% to.bottom %>% center.x) + ggtitle("bottom-center")
+p6 <- overlay.256(dat %>% to.bottom %>% to.right) + ggtitle("bottom-right")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, p5, p6, ncol= 3)
+```
+
+I think the bottom-center version looks the best, in terms of heightening the signal. Actually, the top-center is similar to the bottom-center (probably because apple drawings tend to have larger height than width?). But let's do something else.
+
+```{r, fig.width=10, fig.height=5.5}
+p2b <- overlay.256(dat %>% stretch.x) + ggtitle("top-stretch-x")
+p5b <- overlay.256(dat %>% to.bottom %>% stretch.x) + ggtitle("bottom-stretch-x")
+
+gridExtra::grid.arrange(p1, p2, p2b, p3, p4, p5, p5b, p6, ncol= 4)
+```
+
+The stretch-x versions look better than the non-stretched versions.
+
+
+```{r, fig.width=10, fig.height=5.5, echo=FALSE, eval=FALSE}
+p5b <- dat %>% 
+    to.bottom %>% 
+    scale.to.width %>%
+    mutate(y2 = y * 255 / max(y),
+           x = x * 255 / max(y),
+           y = y2) %>%
+    select(-y2) %>%
+    center.x %>%
+    overlay.256 + ggtitle("bottom-center-same-width")
+p2b <- dat %>% 
+    to.bottom %>% 
+    scale.to.width %>%
+    mutate(y2 = y * 255 / max(y),
+           x = x * 255 / max(y),
+           y = y2) %>%
+    select(-y2) %>%
+    center.x %>%
+    to.top %>%
+    overlay.256 + ggtitle("top-center-same-width")
+
+gridExtra::grid.arrange(p1, p2, p2b, p3, p4, p5, p5b, p6, ncol= 4)
+```
+
+
+## Asparagus
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("asparagus")
+```
+
+```{r}
+rotate.vert <- function(data) {
+    data <- data %>%
+        center.x() %>%
+        center.y()
+        
+    new <- NULL
+    for (i in unique(data$key_id)) {
+        sub <- data %>% filter(key_id == i)
+        sub <- sub %>% bind_cols(prcomp(sub %>% select(x, y),
+                                        center = TRUE)$x %>%
+                                     as_tibble()) %>%
+            rename(x.old = "x", y.old = "y",
+                   x = "PC2", y = "PC1")
+        new <- rbind(new, sub)
+    }
+    new %>%
+        group_by(key_id) %>%
+        to.left() %>%
+        to.bottom() %>%
+        scale.to.height() %>%
+        center.x() %>%
+        center.y() %>%
+        mutate(d.x = abs(x - x.old), d.x.flip = abs((255 - x) - x.old),
+               d.y = abs(y - y.old), d.y.flip = abs((255 - y) - y.old)) %>%
+        ungroup() %>%
+        group_by(key_id) %>%
+        mutate(mean.d.x = mean(d.x), mean.d.x.flip = mean(d.x.flip),
+               mean.d.y = mean(d.y), mean.d.y.flip = mean(d.y.flip)) %>%
+        mutate(x = (mean.d.x <= mean.d.x.flip) * x + 
+                   (mean.d.x >  mean.d.x.flip) * (255 - x),
+               y = (mean.d.y <= mean.d.y.flip) * y +
+                   (mean.d.y >  mean.d.y.flip) * (255 - y)) %>%
+        ungroup() %>%
+        select(-c(x.old, y.old, 
+                  d.x, d.x.flip, d.y, d.y.flip,
+                  mean.d.x, mean.d.x.flip, mean.d.y, mean.d.y.flip))
+}
+
+rotate.hori <- function(data) {
+    data <- data %>%
+        center.x() %>%
+        center.y()
+        
+    new <- NULL
+    for (i in unique(data$key_id)) {
+        sub <- data %>% filter(key_id == i)
+        sub <- sub %>% bind_cols(prcomp(sub %>% select(x, y),
+                                        center = TRUE)$x %>%
+                                     as_tibble()) %>%
+            rename(x.old = "x", y.old = "y",
+                   x = "PC1", y = "PC2")
+        new <- rbind(new, sub)
+    }
+    new %>%
+        group_by(key_id) %>%
+        to.left() %>%
+        to.bottom() %>%
+        scale.to.width() %>%
+        center.x() %>%
+        center.y() %>%
+        mutate(d.x = abs(x - x.old), d.x.flip = abs((255 - x) - x.old),
+               d.y = abs(y - y.old), d.y.flip = abs((255 - y) - y.old)) %>%
+        ungroup() %>%
+        group_by(key_id) %>%
+        mutate(mean.d.x = mean(d.x), mean.d.x.flip = mean(d.x.flip),
+               mean.d.y = mean(d.y), mean.d.y.flip = mean(d.y.flip)) %>%
+        mutate(x = (mean.d.x <= mean.d.x.flip) * x + 
+                   (mean.d.x >  mean.d.x.flip) * (255 - x),
+               y = (mean.d.y <= mean.d.y.flip) * y +
+                   (mean.d.y >  mean.d.y.flip) * (255 - y)) %>%
+        ungroup() %>%
+        select(-c(x.old, y.old, 
+                  d.x, d.x.flip, d.y, d.y.flip,
+                  mean.d.x, mean.d.x.flip, mean.d.y, mean.d.y.flip))
+}
+```
+
+
+
+
+
+```{r, fig.width=12, fig.height=2.5}
+dat <- read_csv(here::here("data", "train_simplified", "asparagus",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 2))
+
+p1 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("2 original")
+p2 <- overlay.256(dat %>% rotate.vert) + ggtitle("2 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "asparagus",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 10))
+
+p3 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("10 original")
+p4 <- overlay.256(dat %>% rotate.vert) + ggtitle("10 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "asparagus",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 100))
+
+p5 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("100 original")
+p6 <- overlay.256(dat %>% rotate.vert) + ggtitle("100 rotated")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 6)
+```
+
+Let's see what happens to the apples if we apply this rotation on them.
+
+
+```{r, fig.width=12, fig.height=2.5}
+dat <- read_csv(here::here("data", "train_simplified", "apple",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 2))
+
+p1 <- overlay.256(dat) + ggtitle("2 original")
+p2 <- overlay.256(dat %>% rotate.vert) + ggtitle("2 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "apple",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 10))
+
+p3 <- overlay.256(dat) + ggtitle("10 original")
+p4 <- overlay.256(dat %>% rotate.vert) + ggtitle("10 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "apple",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 100))
+
+p5 <- overlay.256(dat) + ggtitle("100 original")
+p6 <- overlay.256(dat %>% rotate.vert) + ggtitle("100 rotated")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 6)
+```
+
+
+## Banana
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("banana")
+```
+
+
+```{r, fig.width=12, fig.height=2.5}
+dat <- read_csv(here::here("data", "train_simplified", "banana",
+                           "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 2))
+
+p1 <- overlay.256(dat) + ggtitle("2 original")
+p2 <- overlay.256(dat %>% rotate.hori) + ggtitle("2 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "banana",
+                           "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 10))
+
+p3 <- overlay.256(dat) + ggtitle("10 original")
+p4 <- overlay.256(dat %>% rotate.hori) + ggtitle("10 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "banana",
+                           "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 100))
+
+p5 <- overlay.256(dat) + ggtitle("100 original")
+p6 <- overlay.256(dat %>% rotate.hori) + ggtitle("100 rotated")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 6)
+```
+
+Let's flip concave bananas to convex.
+
+```{r}
+flip.banana <- function(data) {
+    data %>%
+        group_by(key_id) %>%
+        mutate()
+}
+```
+
+
+
+## Birthday cake
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("birthday cake")
+```
+
+
+## Blueberry
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("blueberry")
+```
+
+
+## Blackberry
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("blackberry")
+```
+
+
+## Bread
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("bread")
+```
+
+
+## Broccoli
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("broccoli")
+```
+
+
+## Cake
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("cake")
+```
+
+
+## Carrot
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("carrot")
+```
+
+
+## Cookie
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("cookie")
+```
+
+
+## Donut
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("donut")
+```
+
+
+## Grapes
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("grapes")
+```
+
+
+## Hamburger
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("hamburger")
+```
+
+
+## Hot dog
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("hot dog")
+```
+
+
+## Ice cream
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("ice cream")
+```
+
+
+## Lollipop
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("lollipop")
+```
+
+```{r, fig.width=12, fig.height=2.5}
+dat <- read_csv(here::here("data", "train_simplified", "lollipop",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 2))
+
+p1 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("2 original")
+p2 <- overlay.256(dat %>% rotate.vert) + ggtitle("2 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "lollipop",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 10))
+
+p3 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("10 original")
+p4 <- overlay.256(dat %>% rotate.vert) + ggtitle("10 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "lollipop",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 100))
+
+p5 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("100 original")
+p6 <- overlay.256(dat %>% rotate.vert) + ggtitle("100 rotated")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 6)
+```
+
+
+
+## Mushroom
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("mushroom")
+```
+
+
+## Onion
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("onion")
+```
+
+
+## Peanut
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("peanut")
+```
+
+
+## Pear
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("pear")
+```
+
+
+## Peas
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("peas")
+```
+
+
+## Pineapple
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("pineapple")
+```
+
+
+## Pizza
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("pizza")
+```
+
+
+## Popsicle
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("popsicle")
+```
+
+```{r, fig.width=12, fig.height=2.5}
+dat <- read_csv(here::here("data", "train_simplified", "popsicle",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 2))
+
+p1 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("2 original")
+p2 <- overlay.256(dat %>% rotate.vert) + ggtitle("2 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "popsicle",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 10))
+
+p3 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("10 original")
+p4 <- overlay.256(dat %>% rotate.vert) + ggtitle("10 rotated")
+
+dat <- read_csv(here::here("data", "train_simplified", "popsicle",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 100))
+
+p5 <- overlay.256(dat %>% center.x %>% center.y) + ggtitle("100 original")
+p6 <- overlay.256(dat %>% rotate.vert) + ggtitle("100 rotated")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 6)
+```
+
+
+## Potato
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("potato")
+```
+
+
+## Sandwich
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("sandwich")
+```
+
+
+## Steak
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("steak")
+```
+
+
+## Strawberry
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("strawberry")
+```
+
+
+## String bean
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("string bean")
+```
+
+
+## Watermelon
+
+```{r, fig.width=12, fig.height=4.5}
+several.samples("watermelon")
+```
+
+
+# Resolution reduction
+
+```{r}
+resoduce <- function(data) {
+    data %>%
+        mutate(x = floor(x/8),
+               y = floor(y/8))
+}
+```
+
+```{r, fig.width=5, fig.height=2.5}
+dat <- read_csv(here::here("data", "train_simplified", "popsicle",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 4))
+
+dat.32 <- resoduce(dat)
+
+dim(dat); dim(dat.32)
+
+p1 <- overlay.256(dat) + ggtitle("original")
+p2 <- overlay.32(dat.32) + ggtitle("resolution 1/8")
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r}
+to_raster <- function(data) {
+    data <- data %>%
+        group_by(key_id) %>%
+        mutate(x.lead = lag(x),
+               y.lead = lag(y),
+               same.stroke = stroke==lag(stroke)) %>%
+        ungroup() %>%
+        filter(same.stroke == TRUE) %>%
+        select(-same.stroke) %>%
+        mutate(xdiff = x - x.lead,
+               ydiff = y - y.lead)
+    
+    points.1 <- data %>%
+        filter(xdiff == 0) %>%
+        rowwise() %>%
+        do(data.frame(key_id = .$key_id,
+                      stroke = .$stroke,
+                      x = .$x,
+                      y = seq(.$y.lead, .$y)))
+    
+    points.2 <- data %>%
+        filter(xdiff != 0, ydiff == 0) %>%
+        rowwise() %>%
+        do(data.frame(key_id = .$key_id,
+                      stroke = .$stroke,
+                      x = seq(.$x.lead, .$x),
+                      y = .$y))
+    
+    points.3 <- data %>%
+        filter(xdiff != 0, ydiff != 0, abs(xdiff) >= abs(ydiff)) %>%
+        mutate(slope = ydiff / xdiff) %>%
+        rowwise() %>%
+        do(data.frame(key_id = .$key_id,
+                      stroke = .$stroke,
+                      x = seq(.$x.lead, .$x),
+                      y = .$y.lead + round(seq(0, .$xdiff) * .$slope)))
+    
+    points.4 <- data %>%
+        filter(xdiff != 0, ydiff != 0, abs(xdiff) < abs(ydiff)) %>%
+        mutate(slope = xdiff / ydiff) %>%
+        rowwise() %>%
+        do(data.frame(key_id = .$key_id,
+                      stroke = .$stroke,
+                      y = seq(.$y.lead, .$y),
+                      x = .$x.lead + round(seq(0, .$ydiff) * .$slope))) %>%
+        select(key_id, stroke, x, y)
+    
+    points <- bind_rows(points.1,
+                        points.2,
+                        points.3,
+                        points.4) %>%
+        group_by(key_id, stroke) %>%
+        distinct() %>%
+        ungroup() %>%
+        select(-stroke)
+    points
+}
+```
+
+
+```{r, fig.width = 8, fig.height=5}
+p1 <- dat.32 %>%
+    ggplot(aes(x = x, y = y)) + 
+    geom_path(aes(group = stroke)) +
+    facet_wrap(. ~ key_id, ncol = 4) +
+    ylim(31, 0) + xlim(0, 31)
+
+p2 <- dat.32 %>%
+    to_raster() %>%
+    ggplot(aes(x = x, y = y)) +
+    geom_point() +
+    facet_wrap(. ~ key_id, ncol = 4) +
+    xlim(0, 31) + ylim(31, 0)
+
+gridExtra::grid.arrange(p1, p2, ncol = 1)
+```
+
+
+```{r, fig.width=8, fig.height=5}
+dat <- read_csv(here::here("data", "train_simplified", "apple",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 4))
+
+dat.32 <- resoduce(dat)
+
+p1 <- dat.32 %>%
+    ggplot(aes(x = x, y = y)) + 
+    geom_path(aes(group = stroke)) +
+    facet_wrap(. ~ key_id, ncol = 4) +
+    ylim(31, 0) + xlim(0, 31)
+
+p2 <- dat.32 %>%
+    to_raster() %>%
+    ggplot(aes(x = x, y = y)) +
+    geom_point() +
+    facet_wrap(. ~ key_id, ncol = 4) +
+    xlim(0, 31) + ylim(31, 0)
+
+gridExtra::grid.arrange(p1, p2, ncol = 1)
+```
+
+```{r, fig.width=8, fig.height=5}
+dat <- read_csv(here::here("data", "train_simplified", "banana",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 4))
+
+dat.32 <- resoduce(dat)
+
+p1 <- dat.32 %>%
+    ggplot(aes(x = x, y = y)) + 
+    geom_path(aes(group = stroke)) +
+    facet_wrap(. ~ key_id, ncol = 4) +
+    ylim(31, 0) + xlim(0, 31)
+
+p2 <- dat.32 %>%
+    to_raster() %>%
+    ggplot(aes(x = x, y = y)) +
+    geom_point() +
+    facet_wrap(. ~ key_id, ncol = 4) +
+    xlim(0, 31) + ylim(31, 0)
+
+gridExtra::grid.arrange(p1, p2, ncol = 1)
+```
+
+```{r, fig.width=8, fig.height=5}
+dat <- read_csv(here::here("data", "train_simplified", "birthday cake",
+                            "US_recognized.csv"),
+                 col_types = cols()) %>%
+            filter(key_id %in% sample(unique(key_id), 4))
+
+dat.32 <- resoduce(dat)
+
+p1 <- dat.32 %>%
+    ggplot(aes(x = x, y = y)) + 
+    geom_path(aes(group = stroke)) +
+    facet_wrap(. ~ key_id, ncol = 4) +
+    ylim(31, 0) + xlim(0, 31)
+
+p2 <- dat.32 %>%
+    to_raster() %>%
+    ggplot(aes(x = x, y = y)) +
+    geom_point() +
+    facet_wrap(. ~ key_id, ncol = 4) +
+    xlim(0, 31) + ylim(31, 0)
+
+gridExtra::grid.arrange(p1, p2, ncol = 1)
+```
