@@ -1,0 +1,138 @@
+---
+title: "MACHINE BRUTE FORCE"
+output: 
+    html_document:
+        theme: cosmo 
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Did you find [Human Intelligence](link to other tab) impressive? We are super impressed! 
+
+Well, the correct classification rates of _OurHIC_ don't quite compare to those by Google's AI, which are in the 9x percent range. But we don't have the kind of human resources Google has. Also, we are interested not just in the end, but also in the learning in the process.
+
+The cool thing is: in building _OurHIC_, we learned lots about how people draw things. Like, you can have a whole pizza, or you can have just a slice. Or most bananas dutifully obey the law of gravity, but some mischievous ones don't.
+
+Now, switching gears, think about this: What if we put all that knowledge aside, as if we had never even looked at those images. Can a machine learning algorithm that does not benefit from our human visual perception (and is pretty much a black box) do a decent job at classifying [_Quick! Draw_](https://quickdraw.withgoogle.com/) images? We tried one that is popular for classifying images: a [convolutional neural network](https://en.wikipedia.org/wiki/Convolutional_neural_network). We name it _OurCNN_ (not the news channel).
+
+
+# _OurCNN_ specs
+
+## Input
+
+32-by-32 image with black/white pixels
+
+## Output
+
+a label out of 31 edibles: 
+
+apple, asparagus, banana, birthday cake, blackberry, blueberry, bread, broccoli, cake, carrot, cookie, donut, grapes, hamburger, hot dog, ice cream, lollipop, mushroom, onion, peanut, pear, peas, pineapple, pizza, popsicle, potato, sandwich, steak, strawberry, string bean, watermelon
+
+## Inside the box
+
+### a. Architecture
+
+2 convolution layers, each with the same structure:
+
+- 32 filters of size 3-by-3, applied with padding
+- ReLU activation followed by batch normalization
+
+1 max-pooling layer
+
+- filters of size 2-by-2
+- followed by 30% dropout
+
+1 dense layer
+
+- 256 neurons
+- ReLU activation followed by batch normalization
+- 30% dropout
+
+final layer
+
+- 31 neurons (for probabilities of the 31 categories)
+- softmax activation
+
+
+### b. Optimization
+
+loss: categorical cross-entropy
+
+metric: accuracy
+
+stochastic gradient descent:
+
+- learning rate 0.001
+- decay 1e-6
+- momentum 0.9
+- Nesterov accelerated
+
+
+### c. Training
+
+20 epochs
+
+batch size 32
+
+use 5000 images per type, split 4:1 into training and validation sets -- a fraction of the 140-300K images available per type
+
+pick the model at the epoch that combines _lowest validation loss_ and _highest validation accuracy_, here epoch 12 -- see the training history below
+
+```{r history, echo=FALSE, fig.align='center', out.width = '70%'}
+knitr::include_graphics("model2_history.png")
+```
+
+
+### d. Data
+
+#### Data reduction
+
+_Quick! Draw_ images are black-and-white and come in 256-by-256 resolution. The data are stroke data, i.e., for each stroke of the pen, a series of points are stored such that if you connect them with straight segments, you recover the stroke.
+
+_OurHIC_ keeps the original resolution, but uses only the points that define the segments.
+
+_OurCNN_ uses those points and points between them, but reduces resolution to 32-by-32.
+
+Here are the three data versions for a watermelon (piece), a sandwich, and a pear.
+
+```{r datareduction, echo=FALSE, fig.align='center', out.width = '70%'}
+knitr::include_graphics("data_reduction_watermelon.png")
+knitr::include_graphics("data_reduction_sandwich.png")
+knitr::include_graphics("data_reduction_pear.png")
+```
+
+Hmm, it is now clear that we fed _OurHIC_ less data than we did _OurCNN_.
+
+Other data that neither classifiers use: time, country of origin, and also stroke sequence (relevant in a fascinating analysis of [how people draw circles](https://qz.com/994486/the-way-you-draw-circles-says-a-lot-about-you/)).
+
+
+#### Data subsetting
+
+_OurHIC_ was trained on a random sample of images of each type, regardless of whether Google AI recognized what type it is.
+
+_OurCNN_ was trained on a random sample of images recognized by Google AI.
+
+Here are two examples of Google-recognized and Google-unrecognized images.
+
+```{r recunrec, echo=FALSE, fig.align='center', out.width = '70%'}
+knitr::include_graphics("rec_unrec_broccoli.png")
+knitr::include_graphics("rec_unrec_blackberry.png")
+```
+
+
+
+# _OurCNN_ performance
+
+We tested the performance of _OurCNN_ on a set of images recognized by Google's AI, a set of images not recognized, and a set of mixed images (the mix reflects the composition of the data). Each set includes 1000 images of each category of edibles.
+
+## Classification probability matrices
+
+![](recognized.png){width=32%} ![](unrecognized.png){width=32%} ![](mix.png){width=32%}
+
